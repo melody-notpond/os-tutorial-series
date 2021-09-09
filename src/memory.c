@@ -11,21 +11,51 @@ struct malloc_header {
     size_t size;
 };
 
-bool initialised = false;
-struct malloc_header* free_list = NULL;
+struct {
+    void* bump_top;
+
+    struct malloc_header* bucket_16;
+    struct malloc_header* bucket_32;
+    struct malloc_header* bucket_64;
+    struct malloc_header* bucket_128;
+    struct malloc_header* bucket_256;
+    struct malloc_header* bucket_512;
+    struct malloc_header* bigger_than_512;
+} global_allocator = { &heap_bottom, 0 };
+
+#define MALLOC_HELPER(n)                                                        \
+do {                                                                            \
+    if (size <= n) {                                                            \
+        if (!global_allocator.bucket_##n) {                                     \
+            size_t bump_inc = sizeof(struct malloc_header) + n;                 \
+            if (global_allocator.bump_top + bump_inc > (void*) &pages_bottom) { \
+                console_puts("[malloc] Out of memory!\n");                      \
+                return NULL;                                                    \
+            }                                                                   \
+                                                                                \
+            struct malloc_header* header = global_allocator.bump_top;           \
+            global_allocator.bump_top += bump_inc;                              \
+            header->size = n;                                                   \
+            return header + 1;                                                  \
+        }                                                                       \
+                                                                                \
+        struct malloc_header* header = global_allocator.bucket_##n;             \
+        global_allocator.bucket_##n = header->next;                             \
+        return header + 1;                                                      \
+    }                                                                           \
+} while (0)
 
 void* malloc(size_t size) {
-    if (!initialised) {
-        free_list = (struct malloc_header*) &heap_bottom;
-        *free_list = (struct malloc_header) {
-            .next = NULL,
-            .size = &pages_bottom - &heap_bottom - sizeof(struct malloc_header)
-        };
-        initialised = true;
-    }
+    MALLOC_HELPER(16);
+    MALLOC_HELPER(32);
+    MALLOC_HELPER(64);
+    MALLOC_HELPER(128);
+    MALLOC_HELPER(256);
+    MALLOC_HELPER(512);
+
 
     struct malloc_header* last = NULL;
-    struct malloc_header* current = free_list;
+    struct malloc_header* current = global_allocator.bigger_than_512;
     while (current) {
         if (current->size >= size) {
             if (current->size > size * 2 + sizeof(struct malloc_header)) {
@@ -33,14 +63,14 @@ void* malloc(size_t size) {
                 struct malloc_header* current_plus_1 = (void*) (current + 1) + 2 * size;
                 current_plus_1->next = next;
                 current_plus_1->size = current->size - size * 2 - sizeof(struct malloc_header);
-                current->size = size * 2;
                 current->next = current_plus_1;
+                current->size = size * 2;
             }
 
             if (last) {
                 last->next = current->next;
             } else {
-                free_list = current->next;
+                global_allocator.bigger_than_512 = current->next;
             }
 
             return current + 1;
@@ -50,13 +80,56 @@ void* malloc(size_t size) {
         current = current->next;
     }
 
-    console_puts("[malloc] Out of memory!\n");
-    return NULL;
+    size_t bump_inc = sizeof(struct malloc_header) + size;
+    if (global_allocator.bump_top + bump_inc > (void*) &pages_bottom) {
+        console_puts("[malloc] Out of memory!\n");
+        return NULL;
+    }
+
+    struct malloc_header* header = global_allocator.bump_top;
+    global_allocator.bump_top += bump_inc;
+    header->size = size;
+    return header + 1;
 }
+
+#undef MALLOC_HELPER
 
 void free(void* ptr) {
     struct malloc_header* header = ptr;
     header--;
-    header->next = free_list;
-    free_list = header;
+
+    switch (header->size) {
+        case 16:
+            header->next = global_allocator.bucket_16;
+            global_allocator.bucket_16 = header;
+            break;
+        case 32:
+            header->next = global_allocator.bucket_32;
+            global_allocator.bucket_32 = header;
+            break;
+        case 64:
+            header->next = global_allocator.bucket_64;
+            global_allocator.bucket_64 = header;
+            break;
+        case 128:
+            header->next = global_allocator.bucket_128;
+            global_allocator.bucket_128 = header;
+            break;
+        case 256:
+            header->next = global_allocator.bucket_256;
+            global_allocator.bucket_256 = header;
+            break;
+        case 512:
+            header->next = global_allocator.bucket_512;
+            global_allocator.bucket_512 = header;
+            break;
+        default:
+            if (header->size > 512) {
+                header->next = global_allocator.bigger_than_512;
+                global_allocator.bigger_than_512 = header;
+            } else {
+                console_printf("[free] Warning: attempted to free value likely not allocated by malloc: %p\n", ptr);
+            }
+            break;
+    }
 }
